@@ -107,6 +107,8 @@ void setup() {
 
   readEEProm();
 
+  Serial.print("Hello! "); Serial.println(analogRead(A2));
+
   soak1 = timeInputToTime(soak1_input);
   soak2 = timeInputToTime(soak2_input);
   
@@ -114,6 +116,22 @@ void setup() {
   current_temp = ktc.readFahrenheit();
   current_state = state_navigating;
   renderDisplay();
+    Serial.print("Hello! "); Serial.println(analogRead(A2));
+
+    for ( uint8_t i = 0, R = 4 - 1, C = 4 - 1; i < 16; i++ ) {
+      float V = (5.0 * float( Col_Res )) / (float(Col_Res) + (float(Row_Res) * float(R)) + (float(Col_Res) * float(C)));
+      float Vfinal = V * (1015 / 5.0);
+
+      Serial.print(KEYS[4 * R + C]); Serial.print(": ");
+      Serial.println(Vfinal);
+
+      if ( C == 0 ) {
+        R--;
+        C = 4 - 1;
+      } else { C--;}
+    }
+
+
 }
 
 void readEEProm() {
@@ -331,15 +349,17 @@ change_phase:
       
       break;
     }
-    Serial.print("Phase: ");
-    Serial.print(current_phase);
-    Serial.print(" Current: ");
-    Serial.print(current_temp);
-    Serial.print(" Ideal: ");
-    Serial.print(ideal_temp);
-    Serial.print(" Relay: ");
-    Serial.print(relay_on);
-    Serial.print("\n");
+    if (false) {
+      Serial.print("Phase: ");
+      Serial.print(current_phase);
+      Serial.print(" Current: ");
+      Serial.print(current_temp);
+      Serial.print(" Ideal: ");
+      Serial.print(ideal_temp);
+      Serial.print(" Relay: ");
+      Serial.print(relay_on);
+      Serial.print("\n");
+    }
 
     if (current_temp < ideal_temp && !relay_on) {
       relay_on = true;
@@ -443,7 +463,6 @@ void readNextDigit(char key) {
       break;
   }
 }
-
 void startRamp1() {
   writeEEProm();
   current_state = state_init;
