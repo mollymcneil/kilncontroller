@@ -4,7 +4,7 @@
 #include <Wire.h>  
 #include <LiquidCrystal_I2C.h> // Using version 1.2.1
 #include <max6675.h>
-#include <OnewireKeypad.h>
+#include "OnewireKeypad.h"
 #include <EEPROM.h>
 
 #define DEBUG 1
@@ -23,7 +23,11 @@ int ktcCLK = 12;
 
 MAX6675 ktc(ktcCLK, ktcCS, ktcSO);
 
-int relayPin = 9;
+int RELAY_PIN = 9;
+
+int RAMP_PIN = 3;
+int SOAK_PIN = 4;
+int COOL_PIN = 5;
 
 // keypad
 
@@ -32,588 +36,519 @@ int relayPin = 9;
 #define Pin A1
 #define Row_Res 4700
 #define Col_Res 1000
+#define Calc_Res 1000
+#define Keyboard_Fudge 3
+
 char KEYS[]= {
   '1','2','3','A',
   '4','5','6','B',
   '7','8','9','C',
   '*','0','#','D'
 };
-OnewireKeypad <Print, 16> KP2(Serial, KEYS, Rows, Cols, A1, Row_Res, Col_Res);
+OnewireKeypad <Print, 16> KP2(Serial, KEYS, Rows, Cols, A1, Row_Res, Col_Res, Calc_Res);
 
-unsigned int EEPROM_CHECK = 0xab1e;
+unsigned int EEPROM_CORRUPT = 0x0;
+unsigned int EEPROM_CHECK = 0x51be;
 
-// logic
-unsigned int target1 = 1550;
-unsigned int rate1 = 300;
-unsigned int soak1_input = 0;
-unsigned long soak1 = 0;
 
-unsigned int target2 = 0;
-unsigned int rate2 = 0;
-unsigned int soak2_input = 0;
-unsigned long soak2 = 0;
 
-enum inputs {
-  input_target1,
-  input_rate1,
-  input_soak1,
-  input_target2,
-  input_rate2,
-  input_soak2
-};
+typedef struct {
+  int target;
+  int rate;
+  int soak_input;
+} phase;
 
-enum states {
-  state_init,
-  state_navigating,
-  state_editing,
-  state_error
-};
+typedef enum {
+  field_rate,
+  field_target,
+  field_soak_input
+} field;
 
-enum phases {
-  phase_off,
-  phase_ramp1,
-  phase_ramp2,
-  phase_soak1,
-  phase_soak2
-};
+typedef enum {
+  mode_navigate,
+  mode_edit,
+  mode_none,
+  mode_ramp,
+  mode_soak,
+} mode;
 
-int current_input = input_target1;
-int current_state = state_init;
-int current_phase = phase_off;
-
-unsigned long started_at = 0;
-
-unsigned long display_updated_at = 0;
-unsigned long current_time = 0;
-
-double current_temp = 0;
-long long current_temp_updated_at = 0;
-
-double start_temp = 0;
-double ideal_temp = 0;
+int editing_phase = 0;
+int running_phase = 0;
+int running_mode = mode_none;
 int relay_on = 0;
+int consecutive_c = 0;
+
+#define MAX_PHASE 9
+phase phases[MAX_PHASE];
+
+int MINIMUM_TEMP = 150;
+
+int current_temp = 0;
+int ideal_temp = 0;
+int ramp_start_temp = 0;
+
+field editing_field = field_target;
+mode editing_mode = mode_navigate;
+
+unsigned long run_phase_start = 0;
+unsigned long current_time = 0;
+unsigned long current_temp_updated_at = 0;
+unsigned long relay_last_toggled_at = 0;
+
+unsigned long phase_get_soak_time(phase *p) {
+  unsigned long hours = p->soak_input / 100;
+  unsigned long minutes = p->soak_input % 100;
+  return hours * HOUR + minutes * MINUTE;
+}
+
+bool phase_is_cool(int i, phase *p) {
+  return i > 0 && phases[i - 1].target > p->target;
+}
+
+void phase_update_target(phase *p, char key, bool first) {
+  int digit = key - '0';
+  if (digit < 0 || digit > 9) {
+    return;
+  }
+
+  if (first) {
+    p->target = digit;
+    return;
+  }
+
+  if (p->target < 1000) {
+    p->target = p->target * 10 + digit;
+  }
+}
+
+void phase_update_rate(int i, phase *p, char key, bool first) {
+  int digit = key - '0';
+  if (digit < 0 || digit > 9) {
+     return;
+  }
+
+  if (i > 0 && p->target < phases[i - 1].target) {
+    digit = 0 - digit;
+  }
+
+  if (first) {
+    p->rate = digit;
+    return;
+  }
+
+  if (p->rate < 100 && p->rate > -100) {
+    p->rate = p->rate * 10 + digit;
+  }
+}
+
+void phase_update_soak_input(phase *p, char key, bool first) {
+  int digit = key - '0';
+  if (digit < 0 || digit > 9) {
+    return;
+  }
+
+  if (first) {
+    p->soak_input = digit;
+    return;
+  }
+
+  if (p->soak_input < 1000) {
+    p->soak_input = p->soak_input * 10 + digit;
+  }
+}
+
+void phase_header_to_screen(char *buff, size_t size) {
+  snprintf(buff, size, "%s", "  TARGET  RATE  HOLD");
+}
+
+void phase_to_screen(int i, phase *p, char *buff, size_t size) {
+  if (phase_is_cool(i, p) && p->rate == 0) {
+    snprintf(buff, size, "%i:%5i\xdf   -%1i\xdf %2i:%02i",
+        i + 1, p->target, p->rate, p->soak_input / 100, p->soak_input % 100
+    );
+    return;
+  }
+
+  snprintf(buff, size, "%i:%5i\xdf%5i\xdf %2i:%02i",
+      i + 1, p->target, p->rate, p->soak_input / 100, p->soak_input % 100
+  );
+}
+
+char buff[4][30];
+
+void set_cursor_position(int r, int c) {
+}
+
+void current_state_to_screen(char *buff, size_t size) {
+
+  int i = 0;
+
+    i += snprintf(buff, size, "NOW %4i\xdf ", current_temp);
+
+  if (running_mode == mode_none) {
+    i += snprintf(buff + i, size - i, "      OFF ");
+    return;
+  }
+
+  if (running_mode == mode_ramp) {
+    if (phase_is_cool(running_phase, &phases[running_phase])) {
+      i += snprintf(buff + i, size - i, "COOL%i", running_phase + 1);
+    } else {
+      i += snprintf(buff + i, size - i, "RAMP%i", running_phase + 1);
+    }
+  } else if (running_mode == mode_soak) {
+    i += snprintf(buff + i, size - i, "HOLD%i", running_phase + 1);
+  }
+
+  int time_in_minutes = (current_time - run_phase_start) / MINUTE;
+  
+  i += snprintf(buff + i, size - i, "%2i:%02i", time_in_minutes / 60, time_in_minutes % 60);
+}
+
+void update_display() {
+
+  int phase_offset = editing_phase == 0 ? 0 : editing_phase - 1;
+  if (editing_mode == mode_none && running_mode != mode_none) {
+    phase_offset = running_phase == 0 ? 0 : running_phase - 1;
+  }
+
+  current_state_to_screen(buff[0], sizeof(buff[0]));
+  phase_header_to_screen(buff[1], sizeof(buff[1]));
+  phase_to_screen(phase_offset, &phases[phase_offset], buff[2], sizeof(buff[2]));
+  phase_to_screen(phase_offset + 1, &phases[phase_offset + 1], buff[3], sizeof(buff[3]));
+
+  for (int i = 0; i < 4; i++) {
+    lcd->setCursor(0, i);
+    lcd->print(buff[i]);
+  }
+
+  if (editing_mode == mode_navigate || editing_mode == mode_edit) {
+    int cursor_col =
+      editing_field == field_target ? 6 :
+      editing_field == field_rate ? 12 :
+      editing_field == field_soak_input ? 19 :
+      0;
+
+    int cursor_row = editing_phase == 0 ? 2 : 3;
+
+    lcd->cursor();
+    lcd->noBlink();
+    lcd->setCursor(cursor_col, cursor_row);
+  } else if (running_mode == mode_ramp || running_mode == mode_soak) {
+    lcd->blink();
+    lcd->noCursor();
+    lcd->setCursor(0, running_phase == 0 ? 2 : 3);
+  } else {
+    lcd->noCursor();
+    lcd->noBlink();
+  }
+}
+
+void handle_key(char key) {
+  Serial.print("Handle key: ");
+  Serial.print(key);
+  Serial.print(" ");
+  Serial.print(analogRead(A1));
+  Serial.print("\n");
+
+  if (key != 'C' && key != '0') {
+    consecutive_c = 0;
+  }
+
+  switch (key) {
+  case '0'...'9':
+
+    if (editing_mode == mode_edit || editing_mode == mode_navigate) {
+
+      switch (editing_field) {
+      case field_target:
+        phase_update_target(&phases[editing_phase], key, editing_mode == mode_navigate);
+        break;
+
+      case field_rate:
+        phase_update_rate(editing_phase, &phases[editing_phase], key, editing_mode == mode_navigate);
+        break;
+
+      case field_soak_input:
+        phase_update_soak_input(&phases[editing_phase], key, editing_mode == mode_navigate);
+        break;
+
+      }
+      editing_mode = mode_edit;
+    }
+    break;
+
+  case 'A':
+  case 'a':
+
+    if (editing_mode == mode_edit || editing_mode == mode_navigate) {
+      if (editing_field == field_soak_input) {
+        editing_phase = (editing_phase + 1) % MAX_PHASE;
+      }
+
+      editing_field = 
+        editing_field == field_target ? field_rate :
+        editing_field == field_rate ? field_soak_input :
+        field_target;
+
+    }
+
+    editing_mode = mode_navigate;
+
+    break;
+
+  case 'B':
+  case 'b':
+
+    if (editing_mode == mode_edit || editing_mode == mode_navigate) {
+      if (editing_field == field_target) {
+        editing_phase = (editing_phase + MAX_PHASE - 1) % MAX_PHASE;
+      }
+
+      editing_field =
+        editing_field == field_soak_input ? field_rate :
+        editing_field == field_rate ? field_target :
+        field_soak_input;
+
+    }
+
+    editing_mode = mode_navigate;
+
+    break;
+
+  case 'C':
+  case 'c':
+    consecutive_c += 1;
+
+    if (consecutive_c == 2) {
+      consecutive_c = 0;
+      lcd->clear();
+      lcd->setCursor(0, 0);
+      lcd->print("Resetting...");
+      for (int i = 0; i < MAX_PHASE; i++) {
+        phases[i].rate = phases[i].target = phases[i].soak_input = 0;
+      }
+      write_ee_prom();
+      delay(1000);
+    } else {
+
+      editing_mode = mode_navigate;
+      handle_key('0');
+
+    }
+
+    break;
+
+  case 'D':
+  case 'd':
+
+    if (running_mode == mode_none) {
+      editing_mode = mode_none;
+      editing_phase = 0;
+      running_mode = mode_ramp;
+      running_phase = 0;
+      ramp_start_temp = max(MINIMUM_TEMP, current_temp);
+      run_phase_start = current_time;
+      
+      write_ee_prom();
+    
+    } else {
+      editing_mode = mode_navigate;
+      editing_phase = 0;
+      running_mode = mode_none;
+      running_phase = 0;
+    }
+
+
+    break;
+
+  case '*':
+
+    editing_phase = (editing_phase + MAX_PHASE - 1) % MAX_PHASE;
+    break;
+
+  case '#':
+
+    editing_phase = (editing_phase + 1) % MAX_PHASE;
+    break;
+  }
+
+  update_display();
+}
+
+bool phase_hit_target(int i, phase *p, int current_temp) {
+
+  if (phase_is_cool(i, p)) {
+    return current_temp <= p->target || current_temp <= MINIMUM_TEMP;
+  }
+  
+  return current_temp >= p->target;
+}
+
+bool phase_hit_time(phase *p, unsigned long time_difference) {
+  return time_difference >= phase_get_soak_time(p);
+}
+
+void update_state() {
+  
+  if (running_mode == mode_none) {
+    digitalWrite(RAMP_PIN, 0);
+    digitalWrite(COOL_PIN, 0);
+    digitalWrite(SOAK_PIN, 0);
+    digitalWrite(RELAY_PIN, 0);
+    return;
+  }
+
+  if (running_mode == mode_ramp) {
+    if (phase_hit_target(running_phase, &phases[running_phase], current_temp)) {
+      running_mode = mode_soak;
+      run_phase_start = current_time;
+      update_state();
+      return;
+    }
+
+    int rate = phases[running_phase].rate;
+    
+    if (phase_is_cool(running_phase, &phases[running_phase]) && (rate >= 0 || rate == -999)) {
+      ideal_temp = phases[running_phase].target;
+      
+    } else if (!phase_is_cool(running_phase, &phases[running_phase]) && (rate <= 0 || rate == 999)) {
+      ideal_temp = phases[running_phase].target;
+    } else {
+      ideal_temp = ramp_start_temp + (float)phases[running_phase].rate * (float)(current_time - run_phase_start) / (float)HOUR;
+    }
+
+
+  } else if (running_mode == mode_soak) {
+    if (phase_hit_time(&phases[running_phase], current_time - run_phase_start)) {
+      if (running_phase + 1 >= MAX_PHASE || 
+           (phases[running_phase].target == 0 && phases[running_phase].rate == 0 && phases[running_phase].soak_input == 0)) {
+        running_mode = mode_none;
+        running_phase = 0;
+        editing_mode = mode_navigate;
+        editing_phase = 0;
+        return;
+      }
+
+      run_phase_start = millis();
+      running_phase += 1;
+      running_mode = mode_ramp;
+      ramp_start_temp = max(MINIMUM_TEMP, current_temp);
+      run_phase_start = current_time;
+
+      update_state();
+      return;
+    }
+
+    ideal_temp = phases[running_phase].target;
+  }
+
+  if (ideal_temp < MINIMUM_TEMP) {
+    ideal_temp = MINIMUM_TEMP;
+  }
+
+  digitalWrite(RAMP_PIN, running_mode == mode_ramp && !phase_is_cool(running_phase, &phases[running_phase]));
+  digitalWrite(COOL_PIN, running_mode == mode_ramp && phase_is_cool(running_phase, &phases[running_phase]));
+  digitalWrite(SOAK_PIN, running_mode == mode_soak);
+
+  Serial.print("current: ");
+  Serial.print(current_temp);
+  Serial.print(" ideal: ");
+  Serial.print(ideal_temp);
+  Serial.print("\n");
+
+  if (current_time - relay_last_toggled_at > 10000) {
+    if (ideal_temp > current_temp && !relay_on) {
+      relay_on = true;
+      relay_last_toggled_at = current_time;
+      digitalWrite(RELAY_PIN, 1);
+    }
+    if (ideal_temp < current_temp && relay_on) {
+      relay_on = false;
+      digitalWrite(RELAY_PIN, 0);
+      relay_last_toggled_at = current_time;
+    }
+  }
+}
+
+void read_ee_prom() {
+  int check = 0;
+  int eeAddress = 0;
+
+  EEPROM.get(eeAddress, check);
+  eeAddress += sizeof(check);
+  if (check != EEPROM_CHECK) {
+    return;
+  }
+
+  for (int i = 0; i < MAX_PHASE; i++) {
+    EEPROM.get(eeAddress, phases[i]);
+    eeAddress += sizeof(phases[i]);
+  }
+}
+
+void write_ee_prom() {
+  int eeAddress = 0;
+  
+  eeAddress += sizeof(EEPROM_CHECK);
+
+  for (int i = 0; i < MAX_PHASE; i++) {
+    EEPROM.put(eeAddress, phases[i]);
+    eeAddress += sizeof(phases[i]);
+  }
+
+  EEPROM.put(0, EEPROM_CHECK);
+}
 
 void setup() {
+  // put your setup code here, to run once:
 
   lcd->begin(20, 4);
   lcd->setCursor(0,0); // first character - 1st line
   lcd->print("Trippnwyk Kiln!");
+  lcd->setCursor(14, 3);
+  lcd->print("(v0.2)");
 
-  KP2.SetDebounceTime(50);
+  KP2.SetDebounceTime(30);
+  KP2.SetFudgeFactor(Keyboard_Fudge);
   Serial.begin(9600);
 
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(relayPin, 0);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, 0);
+  
+  pinMode(SOAK_PIN, OUTPUT);
+  pinMode(RAMP_PIN, OUTPUT);
+  pinMode(COOL_PIN, OUTPUT);
 
-  readEEProm();
+  digitalWrite(SOAK_PIN, 1);
+  digitalWrite(RAMP_PIN, 1);
+  digitalWrite(COOL_PIN, 1);
 
-  Serial.print("Hello! "); Serial.println(analogRead(A2));
-
-  soak1 = timeInputToTime(soak1_input);
-  soak2 = timeInputToTime(soak2_input);
+  read_ee_prom();
   
   delay(1500); // Allow max to initialize? (and display to say hi!)
+
+  digitalWrite(SOAK_PIN, 0);
+  digitalWrite(RAMP_PIN, 0);
+  digitalWrite(COOL_PIN, 0);
+  
   current_temp = ktc.readFahrenheit();
-  current_state = state_navigating;
-  renderDisplay();
-    Serial.print("Hello! "); Serial.println(analogRead(A2));
-
-    for ( uint8_t i = 0, R = 4 - 1, C = 4 - 1; i < 16; i++ ) {
-      float V = (5.0 * float( Col_Res )) / (float(Col_Res) + (float(Row_Res) * float(R)) + (float(Col_Res) * float(C)));
-      float Vfinal = V * (1015 / 5.0);
-
-      Serial.print(KEYS[4 * R + C]); Serial.print(": ");
-      Serial.println(Vfinal);
-
-      if ( C == 0 ) {
-        R--;
-        C = 4 - 1;
-      } else { C--;}
-    }
-
-
+  update_display();
+  Serial.println("Hello! ");
 }
 
-void readEEProm() {
-  int check = 0;
-
-  int eeAddress = 0;
-  
-  EEPROM.get(0, check);
-  EEPROM.get(2, target1);
-  EEPROM.get(4, target2);
-  EEPROM.get(6, rate1);
-  EEPROM.get(8, rate2);
-  EEPROM.get(10, soak1_input);
-  EEPROM.get(12, soak2_input);
-
-  if (check != EEPROM_CHECK || target1 > 9999 || target2 > 9999 || rate1 > 999 || rate2 > 999 || soak1_input > 9999 || soak2_input > 9999) {
-    target1 = target2 = rate1 = rate2 = soak1_input = soak2_input = 0;
-  }
-}
-
-void writeEEProm() {
-  EEPROM.put(0, EEPROM_CHECK);
-  EEPROM.put(2, target1);
-  EEPROM.put(4, target2);
-  EEPROM.put(6, rate1);
-  EEPROM.put(8, rate2);
-  EEPROM.put(10, soak1_input);
-  EEPROM.put(12, soak2_input);
-  readEEProm();
-}
-
-void renderDisplay() {
-  if (current_state == state_error) {
-    return;
-  }
-  lcd->setCursor(0, 0);
-
-  lcd->print("AT "); printTarget(current_temp);
-  
-  switch (current_phase) {
-  case phase_off:
-    lcd->print("        OFF ");
-    break;
-  case phase_ramp1:
-    lcd->print(" RAMP1 "); printTime(current_time - started_at);
-    break;
-  case phase_ramp2:
-    lcd->print(" RAMP2 "); printTime(current_time - started_at);
-    break;
-  case phase_soak1:
-    lcd->print(" SOAK1 "); printTime(current_time - started_at);
-    break;
-  case phase_soak2:
-    lcd->print(" SOAK2 "); printTime(current_time - started_at);
-    break;
-  
-  }
-
-  lcd->setCursor(0, 1);
-  lcd->print("  TARGET  RATE  SOAK");
-  lcd->setCursor(0, 2);
-  lcd->print("1: "); printTarget(target1); lcd->print("  "); printRate(rate1); lcd->print(" "); printTimeInput(soak1_input);
-
-  lcd->setCursor(0, 3);
-  lcd->print("2: "); printTarget(target2); lcd->print("  "); printRate(rate2); lcd->print(" "); printTimeInput(soak2_input);
-  
-  renderCursor();
-  
-  display_updated_at = current_time;
-}
-
-void renderCursor() {
-
-  if (current_state == state_editing || current_state == state_navigating) {
-    
-    lcd->cursor();
-  
-    switch (current_input) {
-    case input_target1:
-      lcd->setCursor(6, 2);
-      break;
-    case input_target2:
-      lcd->setCursor(6, 3);
-      break;
-    case input_rate1:
-      lcd->setCursor(12, 2);
-      break;
-    case input_rate2:
-      lcd->setCursor(12, 3);
-      break;
-    case input_soak1:
-      lcd->setCursor(19, 2);
-      break;
-    case input_soak2:
-      lcd->setCursor(19, 3);
-      break;
-    default:
-      lcd->setCursor(0, 0);
-      lcd->print("Error: invalid state");
-      lcd->setCursor(0, 1);
-      lcd->print("current_input: ");
-      lcd->print(current_input);
-      current_state = state_error;
-    }
-  } else {
-    lcd->noBlink();
-    lcd->noCursor();
-  }
-
-}
-
-// 5 chars "1550°" or "   0°"
-void printTarget(double temp) {
-  static char str[6];
-  sprintf(str, "%4i\xdf", (int)temp);
-  lcd->print(str);
-}
-
-// 4 chars "1550°" or "   0°"
-void printRate(double temp) {
-  static char str[5];
-  sprintf(str, "%3i\xdf\x00", round(temp));
-  lcd->print(str);
-}
-
-// 5 chars "12:30" or " 1:30"
-void printTime(unsigned long ms) {
-  unsigned long minutes = ms / MINUTE;
-  static char str[6];
-  sprintf(str, "%2lu:%02lu", minutes / 60, minutes % 60);
-  lcd->print(str);
-}
-
-// 5 chars "12:30" or " 1:30"
-void printTimeInput(int timeInput) {
-  static char str[6];
-  sprintf(str, "%2i:%02i", timeInput / 100, timeInput % 100);
-  lcd->print(str);
-}
- 
 void loop() {
-  if (current_state == state_error) {
-    return;
-  }
   
   current_time = millis();
    
   if (KP2.Getkey() && KP2.Key_State() == PRESSED) {
-     handleKey(KP2.Getkey());
+     handle_key(KP2.Getkey());
   }
 
   if ((current_time - current_temp_updated_at) > 1000) {
     current_temp_updated_at = current_time;
     current_temp = ktc.readFahrenheit();
-
-change_phase:
-    switch (current_phase) {
-    case phase_off:
-      ideal_temp = 0;
-      break;
-
-    case phase_ramp1:
-      if (current_temp >= target1) {
-        started_at = current_time;
-        current_phase = phase_soak1;
-        goto change_phase;
-      }
-      if (rate1 <= 0) {
-        ideal_temp = target1;
-      } else {
-        ideal_temp = start_temp + 25 +rate1 * (double)(current_time - started_at) / HOUR;
-        if (ideal_temp > target1) {
-          ideal_temp = target1;
-        }
-        Serial.print("TIME ");
-        Serial.print(current_time - started_at);
-        Serial.print(" ideal ");
-        Serial.println(ideal_temp);
-      }
-      
-      break;
-    case phase_ramp2:
-      if (current_temp >= target2) {
-        started_at = current_time;
-        current_phase = phase_soak2;
-        goto change_phase;
-      }
-      if (rate2 <= 0) {
-        ideal_temp = target2;
-      } else {
-        ideal_temp = target1 + 25 + rate1 * (double)(current_time - started_at) / HOUR;
-        if (ideal_temp > target2) {
-          ideal_temp = target2;
-        }
-      }
-
-      break;
-    case phase_soak1:
-      if (current_time - started_at >= soak1) {
-        started_at = current_time;
-        current_phase = phase_ramp2;
-        goto change_phase;
-      }
-      ideal_temp = target1;
-      
-      break;
-  
-    case phase_soak2:
-     if (current_time - started_at >= soak2) {
-        started_at = current_time;
-        current_phase = phase_off;
-        goto change_phase;
-      }
-      ideal_temp = target2;
-      
-      break;
-    }
-    if (false) {
-      Serial.print("Phase: ");
-      Serial.print(current_phase);
-      Serial.print(" Current: ");
-      Serial.print(current_temp);
-      Serial.print(" Ideal: ");
-      Serial.print(ideal_temp);
-      Serial.print(" Relay: ");
-      Serial.print(relay_on);
-      Serial.print("\n");
-    }
-
-    if (current_temp < ideal_temp && !relay_on) {
-      relay_on = true;
-      digitalWrite(relayPin, 1);
-      Serial.println("RELAY ON");
-    } else if (current_temp > ideal_temp && relay_on) {
-      relay_on = false;
-      digitalWrite(relayPin, 0);
-      Serial.println("RELAY OFF");
-    }
-
-    renderDisplay(); 
-  }
-
-
-}
-
-void readFirstDigit(char key) {
-  int value = key - '0';
-  if (value < 0 || value > 9) {
-      lcd->setCursor(0, 0);
-      lcd->print("Error: invalid digit: ");
-      lcd->print(key);
-      lcd->print(value);
-      current_state = state_error;
-      return;
-  }
-  
-  switch (current_input) {
-    case input_target1:
-      target1 = value;
-      break;
-    case input_target2:
-      target2 = value;
-      break;
-    case input_rate1:
-      rate1 = value;
-      break;
-    case input_rate2:
-      rate2 = value;
-      break;
-    case input_soak1:
-      soak1_input = value;
-      soak1 = timeInputToTime(soak1_input);
-      break;
-    case input_soak2:
-      soak2_input = value;
-      soak2 = timeInputToTime(soak2_input);
-      break;
+    update_state();
+    update_display();
   }
 }
-
-unsigned long timeInputToTime(int input) {
-  unsigned long hours = input / 100;
-  unsigned long minutes = input % 100;
-  return hours * HOUR + minutes * MINUTE;
-}
-
-void readNextDigit(char key) {
-  int value = key - '0';
-  if (value < 0 || value > 9) {
-      lcd->setCursor(0, 0);
-      lcd->print("Error: invalid digit: ");
-      lcd->print(key);
-      current_state = state_error;
-      return;
-  }
-  
-  switch (current_input) {
-    case input_target1:
-      if (target1 < 1000) {
-        target1 = 10 * target1 + value;
-      }
-      break;
-    case input_target2:
-      if (target2 < 1000) {
-        target2 = 10 * target2 + value;
-      }
-      break;
-    case input_rate1:
-      if (rate1 < 100) {
-        rate1 = 10 * rate1 + value;
-      }
-      break;
-    case input_rate2:
-      if (rate2 < 100) {
-        rate2 = 10 * rate2 + value;
-      }
-      break;
-    case input_soak1:
-      if (soak1_input < 1000) {
-        soak1_input = 10 * soak1_input + value;
-        soak1 = timeInputToTime(soak1_input);
-      }
-      break;
-    case input_soak2:
-      if (soak2_input < 1000) {
-        soak2_input = 10 * soak2_input + value;
-        soak2 = timeInputToTime(soak2_input);
-      }
-      break;
-  }
-}
-void startRamp1() {
-  writeEEProm();
-  current_state = state_init;
-  started_at = current_time;
-  start_temp = current_temp;
-  current_phase = phase_ramp1;
-}
-
-void handleKey(char key) {
-
-  if (DEBUG) {
-    Serial.print(analogRead(A1));
-    Serial.print(" Key: ");
-    Serial.print(key);
-    Serial.print(" State: ");
-    Serial.print(current_state);
-    Serial.print(" Input: ");
-    Serial.print(current_input);
-  }
-  
-  switch (current_state) {
-  case state_init:
-
-    switch (key) {
-      case 'A':
-        current_input = input_target1;
-        current_state = state_navigating;
-        break;
-      case 'B':
-        current_input = input_soak1;
-        current_state = state_navigating;
-        break;
-      
-      case 'C':
-        break;
-      case 'D':
-        startRamp1();
-        break;
-        
-      case '*':
-      case '#':
-      case '0' ... '9':
-
-        // TODO
-        break;
-      default:
-        goto invalid_key;
-        break;
-    }
-
-    break;
-
-  case state_navigating:
-    switch (key) {
-      case 'A':
-        current_input = (current_input + 1) % 6;
-        break;
-      case 'B':
-        current_input = (current_input + 5) % 6;
-        break;
-
-      case 'C':
-        readFirstDigit('0');
-        break;
-        
-      case 'D':
-        startRamp1();
-        break;
-      case '*':
-      case '#':
-        // TODO
-        break;
-        
-      case '0' ... '9':
-        readFirstDigit(key);
-        current_state = state_editing;
-        break;
-
-      default:
-        goto invalid_key;
-        break;
-    }
-    
-    break;
-
-  case state_editing:
-    switch (key) {
-      case 'A':
-        current_input = (current_input + 1) % 6;
-        current_state = state_navigating;
-        break;
-      case 'B':
-        current_input = (current_input + 5) % 6;
-        current_state = state_navigating;
-        break;
-
-      case 'C':
-        readFirstDigit('0');
-        current_state = state_editing;
-        break;
-        
-      case 'D':
-        startRamp1();
-        break;
-        
-      case '*':
-      case '#':
-        // TODO
-        break;
-        
-      case '0' ... '9':
-        readNextDigit(key);
-        break;
-
-      default:
-        goto invalid_key;
-        break;
-    }
-    
-    break;
- 
-  case state_error:
-    // TODO: add a way to reset?
-    break;
-  default:
-    lcd->setCursor(0, 0);
-    lcd->print("Error: invalid state");
-    lcd->setCursor(0, 1);
-    lcd->print("current_state: ");
-    lcd->print(current_state);
-    current_state = state_error;
-  }
-
-  renderDisplay();
-
-  if (DEBUG) {
-    Serial.print(" ->");
-    Serial.print(" State: ");
-    Serial.print(current_state);
-    Serial.print(" Input: ");
-    Serial.print(current_input);
-    Serial.print("\n");
-  }
-  return;
-
-invalid_key:
-    lcd->setCursor(0, 0);
-    lcd->print("Error: invalid key: ");
-    lcd->print(key);
-    current_state = state_error;
-    renderDisplay();
-    return;
-}
-
